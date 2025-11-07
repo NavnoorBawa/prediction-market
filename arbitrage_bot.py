@@ -118,7 +118,8 @@ class PolymarketClient:
         logger.info("🔧 Enriching markets with CLOB details...")
         enriched_markets = []
 
-        for i, market in enumerate(all_markets[:100]):  # Limit to 100 for testing
+        max_markets = min(len(all_markets), 200)  # Process up to 200 markets per scan
+        for i, market in enumerate(all_markets[:max_markets]):
             condition_id = market.get('condition_id') or market.get('conditionId')
 
             if condition_id and condition_id.strip():  # Only if we have a valid condition_id
@@ -129,8 +130,8 @@ class PolymarketClient:
                 else:
                     enriched_markets.append(market)  # Fallback to original
 
-                if (i + 1) % 20 == 0:
-                    logger.info(f"  Enriched {i + 1}/{min(len(all_markets), 100)} markets...")
+                if (i + 1) % 50 == 0:
+                    logger.info(f"  Enriched {i + 1}/{max_markets} markets...")
 
                 await asyncio.sleep(0.05)  # Rate limiting
             else:
@@ -305,12 +306,13 @@ class PolymarketClient:
 class ArbitrageDetector:
     """Implements arbitrage detection strategies from IMDEA research"""
 
-    # Research-backed thresholds - VERY LOW to catch anything
-    MIN_PROFIT_THRESHOLD = 0.001  # 0.1 cents minimum (very low for testing)
+    # Research-backed thresholds - Realistic for actual trading
+    MIN_PROFIT_THRESHOLD = 0.01  # 1 cent minimum (realistic spread)
+    MAX_PROFIT_THRESHOLD = 0.50  # 50 cents max (filter out stale markets)
     NEGRISK_MULTIPLIER = 29  # 29× capital efficiency advantage
     WHALE_THRESHOLD = 1000  # $1,000+ trades (lowered)
     HIGH_URGENCY_ROI = 0.05  # 5%+ ROI
-    MEDIUM_URGENCY_ROI = 0.01  # 1%+ ROI
+    MEDIUM_URGENCY_ROI = 0.02  # 2%+ ROI
 
     def __init__(self):
         self.opportunities: List[ArbitrageOpportunity] = []
@@ -343,6 +345,10 @@ class ArbitrageDetector:
             return None
 
         try:
+            # Filter out closed/archived markets
+            if market.get('closed') or market.get('archived') or not market.get('active'):
+                return None
+
             # Get best prices
             yes_asks = yes_orderbook.get('asks', [])
             no_asks = no_orderbook.get('asks', [])
@@ -358,8 +364,17 @@ class ArbitrageDetector:
                 self.diagnostics['no_prices'] += 1
                 return None
 
+            # Filter out placeholder/extreme prices (likely inactive markets)
+            # Real markets rarely have both sides at 0.95+
+            if yes_best_ask >= 0.95 and no_best_ask >= 0.95:
+                return None
+
             sum_price = yes_best_ask + no_best_ask
             deviation = abs(1.0 - sum_price)
+
+            # Filter out unrealistic deviations (>50% = likely stale/closed market)
+            if deviation > 0.50:
+                return None
 
             # Log ALL deviations for debugging
             if deviation > 0:
@@ -372,7 +387,7 @@ class ArbitrageDetector:
                 no_liquidity = sum(float(ask.get('size', 0)) for ask in no_asks[:5])
                 min_liquidity = min(yes_liquidity, no_liquidity)
 
-                if min_liquidity < 1:  # Very low threshold for testing
+                if min_liquidity < 10:  # Minimum $10 liquidity for realistic trading
                     return None
 
                 capital_required = sum_price * min_liquidity
@@ -433,6 +448,10 @@ class ArbitrageDetector:
         """
         self.diagnostics['negrisk_checked'] += 1
 
+        # Filter out closed/archived markets
+        if market.get('closed') or market.get('archived') or not market.get('active'):
+            return None
+
         # Get tokens from market
         tokens = (market.get('tokens') or
                  market.get('outcomes') or
@@ -483,11 +502,15 @@ class ArbitrageDetector:
             if deviation > 0:
                 logger.debug(f"NegRisk deviation found: {deviation:.4f} (sum={prob_sum:.4f})")
 
+            # Filter out unrealistic deviations (>50% = likely stale/closed market)
+            if deviation > self.MAX_PROFIT_THRESHOLD:
+                return None
+
             # Check if profitable
             if deviation > self.MIN_PROFIT_THRESHOLD:
                 min_liquidity = min(liquidities)
 
-                if min_liquidity < 1:  # Very low threshold for testing
+                if min_liquidity < 10:  # Minimum $10 liquidity for realistic trading
                     return None
 
                 capital_required = prob_sum * min_liquidity
@@ -816,13 +839,13 @@ class PredictionMarketBot:
             logger.info(f"🎯 Analyzing {len(all_markets)} markets for arbitrage...\n")
 
             # Process in batches to manage memory and provide progress updates
-            batch_size = 50  # Increased batch size
+            batch_size = 50
             all_opportunities = []
+            total_batches = (len(all_markets) + batch_size - 1) // batch_size
 
-            for i in range(0, min(len(all_markets), 100), batch_size):  # LIMIT TO 100 for testing
+            for i in range(0, len(all_markets), batch_size):
                 batch = all_markets[i:i+batch_size]
                 batch_num = (i // batch_size) + 1
-                total_batches = min((len(all_markets) + batch_size - 1) // batch_size, 2)
 
                 batch_opps = await self.analyze_market_batch(
                     batch, client, batch_num, total_batches
@@ -840,17 +863,26 @@ class PredictionMarketBot:
 
     async def run_continuous(self):
         """Run continuous monitoring - FULL MARKET"""
-        logger.info("🚀 Prediction Market Arbitrage Bot Starting (FULL MARKET MODE WITH DIAGNOSTICS)...")
-        logger.info(f"📊 Scanning ALL available markets")
+        logger.info("🚀 Prediction Market Arbitrage Bot Starting (FULL MARKET MODE)...")
+        logger.info(f"📊 Scanning up to 200 markets per cycle")
         logger.info(f"⏰ Scan interval: {self.scan_interval} seconds")
-        logger.info(f"💰 Minimum profit threshold: ${self.detector.MIN_PROFIT_THRESHOLD*100:.2f} cents")
+        logger.info(f"💰 Profit threshold: ${self.detector.MIN_PROFIT_THRESHOLD*100:.1f}¢ to ${self.detector.MAX_PROFIT_THRESHOLD*100:.1f}¢")
         logger.info("\nStrategies Active:")
         logger.info("  1. Single-Condition Arbitrage (YES+NO≠$1.00)")
         logger.info("  2. NegRisk Rebalancing (Σprices≠1.00, 29× efficiency)")
         logger.info("\n" + "="*80 + "\n")
 
-        # Run only once for testing
-        await self.run_single_scan()
+        while True:
+            try:
+                await self.run_single_scan()
+                await asyncio.sleep(self.scan_interval)
+            except KeyboardInterrupt:
+                logger.info("\n\n🛑 Bot stopped by user")
+                break
+            except Exception as e:
+                logger.error(f"⚠️  Error in main loop: {e}")
+                logger.info(f"   Retrying in {self.scan_interval} seconds...")
+                await asyncio.sleep(self.scan_interval)
 
 
 # ============================================================================
@@ -863,7 +895,7 @@ async def main():
     print("""
 ╔═══════════════════════════════════════════════════════════════════════════╗
 ║                  PREDICTION MARKET ARBITRAGE BOT                          ║
-║                  FULL MARKET SCANNER + DIAGNOSTICS                        ║
+║                        FULL MARKET SCANNER                                ║
 ║                                                                           ║
 ║  Based on IMDEA Networks Research: $39.59M Arbitrage Extracted           ║
 ║  April 2024 - April 2025                                                 ║
@@ -872,7 +904,8 @@ async def main():
 ║    • Single-Condition: $10.58M extracted (7,051 conditions)              ║
 ║    • NegRisk: $28.99M extracted (662 markets, 29× efficiency)            ║
 ║                                                                           ║
-║  🔥 DIAGNOSTIC MODE: Testing first 100 markets                           ║
+║  ✅ Filters: Active markets only, realistic spreads (1-50¢)              ║
+║  ✅ Scans: Up to 200 markets every 2 minutes                             ║
 ║                                                                           ║
 ║  ⚠️  DISCLAIMER: Detection only - NOT automatic execution                 ║
 ║  ⚠️  Always verify opportunities manually before trading                  ║
